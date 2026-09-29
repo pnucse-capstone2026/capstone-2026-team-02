@@ -46,6 +46,123 @@
 
 노드·간선 사전과 인접 인덱스는 호출 전에 초기화되어 있어야 한다. 반환된 간선 목록을 장면 맥락으로 구성하고 생성 모델에 전달하는 처리는 이후 단계에서 수행한다.
 
+## 시스템 수치로 구성하는 응답
+
+게임 상태의 수치와 생성 문장의 주장은 서로 다른 근거를 가진다. 아래는 서버의 실제 전후 상태에서 자원 변경량을 계산하고, 정산 결과가 있는 응답의 수치 필드에 그 값을 사용하는 구간이다. 기존 발췌와 같은 구현에서 가져왔으며 각 코드 블록은 연속된 원문이다.
+
+### 실제 상태에서 자원 변경량 계산
+
+`ResourceDelta.from_player`는 행동 전 스냅샷과 처리 후 캐릭터 상태를 비교한다. HP·MP·골드 변경량의 입력은 생성 문장이 아니라 두 시점의 값이다. 아래는 클래스 메서드 전체이며, 변경량과 스냅샷 유무를 보관하는 데이터 클래스의 필드 선언은 생략하였다.
+
+```python
+    @classmethod
+    def from_player(cls, pre_action_stats: dict[str, Any] | None, player: Any) -> ResourceDelta:
+        if not isinstance(pre_action_stats, dict):
+            return cls()
+        hp_before = int(pre_action_stats["hp"])
+        mp_before = int(pre_action_stats["mp"])
+        gold_before = int(pre_action_stats["gold"])
+        exp_before = int(pre_action_stats.get("exp", 0))
+        level_before = int(pre_action_stats.get("level", 0))
+        return cls(
+            hp=int(getattr(player, "current_hp", hp_before)) - hp_before,
+            mp=int(getattr(player, "current_mp", mp_before)) - mp_before,
+            gold=int(getattr(player, "gold", gold_before)) - gold_before,
+            exp=int(getattr(player, "exp", exp_before)) - exp_before,
+            level=int(getattr(player, "level", level_before)) - level_before,
+            snapshot_available=True,
+        )
+```
+
+정산 객체를 만드는 `SettlementResult.from_pipeline_state`는 이 메서드에 행동 전 상태와 현재 캐릭터를 전달한다. 다른 정산 필드의 구성과 객체 저장 처리는 이 발췌에 포함하지 않았다.
+
+### 정산 결과로 응답 수치 구성
+
+`settlement_response_player_updates`는 기존 응답 필드를 복사한 뒤, 정산의 HP·MP·골드 변경량으로 해당 수치 필드를 구성한다. 딕셔너리 경로에서는 스냅샷과 필수 필드의 존재를 검사하고 정수값을 대입한다. 다른 응답 필드는 유지한다.
+
+```python
+def settlement_response_player_updates(
+    settlement: Mapping[str, Any] | SettlementResult | None,
+    existing_updates: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build response player_updates from the settlement resource owner."""
+
+    updates = _copy_player_updates(existing_updates)
+    if settlement is None:
+        return updates
+    if isinstance(settlement, SettlementResult):
+        resource_updates = settlement.resource_delta.to_player_updates()
+        if not resource_updates:
+            _reject_existing_resource_updates(updates)
+            return updates
+        updates.update(resource_updates)
+        return updates
+    if not isinstance(settlement, Mapping):
+        raise ValueError("settlement response source must be a mapping")
+
+    if "resource_delta" not in settlement:
+        raise ValueError("settlement missing resource_delta")
+    raw_resource_delta = settlement["resource_delta"]
+    if not isinstance(raw_resource_delta, Mapping):
+        raise ValueError("settlement resource_delta must be a mapping")
+    if not raw_resource_delta.get("snapshot_available", False):
+        _reject_existing_resource_updates(updates)
+        return updates
+
+    for source_key, target_key in (
+        ("hp", "hp_change"),
+        ("mp", "mp_change"),
+        ("gold", "gold_change"),
+    ):
+        if source_key not in raw_resource_delta:
+            raise ValueError(f"settlement resource_delta missing {source_key}")
+        updates[target_key] = _response_player_update_int(
+            raw_resource_delta[source_key],
+            f"settlement resource_delta {source_key}",
+        )
+    return updates
+```
+
+보조 함수 `_copy_player_updates`는 매핑을 깊은 복사하고, `_response_player_update_int`는 불리언을 제외한 정수만 허용한다. `_reject_existing_resource_updates`는 스냅샷이 없는 정산에 기존 HP·MP·골드 변경 필드가 섞여 있으면 오류를 발생시킨다. `SettlementResult`의 객체 정의와 이 보조 함수들은 생략하였다. 정산 자체가 `None`이면 기존 필드를 반환하는 분기도 있으므로, 이 함수만으로 모든 호출의 정산 존재를 보장한다고 해석하지 않는다.
+
+### 상태 응답에 연결
+
+게임 루프는 세션의 정산 결과와 추출 결과를 위 함수에 전달한다. 아래는 호출 메서드 전체다.
+
+```python
+    @staticmethod
+    def _settlement_player_updates_for_response(
+        session: dict,
+        result: dict,
+    ) -> dict[str, object]:
+        return settlement_response_player_updates(
+            session.get("_last_settlement_result"),
+            result.get("player_updates"),
+        )
+```
+
+같은 게임 루프의 `process_action_stream`은 이 반환값을 `STATE_UPDATE`의 `player_updates`로 전달한다. 아래는 해당 이벤트 구성 전체이며, 앞선 캐릭터 상태·장면·알림 구성과 이후 처리는 생략하였다.
+
+```python
+                yield SSEEvent(event=SSEEventType.STATE_UPDATE, data={
+                    "character": char_state,
+                    "sequences": [s.model_dump() for s in pydantic_sequences],
+                    "notices": [notice.model_dump() for notice in notices],
+                    "speaker_metadata": speaker_metadata,
+                    "encountered_players": result.get("encountered_players", []),
+                    "player_updates": self._settlement_player_updates_for_response(
+                        session,
+                        result,
+                    ),
+                    "ai_reasoning": None,
+                    "intent_feedback": intent_feedback,
+                    "intent_success": intent_success,
+                    **self._stream_scene_meta_payload_for_scene(session, final_stream_scene),
+                })
+```
+
+이 구간은 정산 결과가 있는 응답에서 수치 변경량의 출처와 전달을 보여준다. 전투 계산식, 모든 상태 변경 경로, 영속 저장과 Flutter의 소비 구현 전체를 포함하지는 않는다. 최종보고서 제4.4절의 전투 결과와 제4.4.1절의 MP 불변 사례는 실제 관측 결과를 별도로 제시한다. 서술 오류가 수치 변경으로 이어지지 않은 것과, 그 오류 문장이 사용자에게 표시되지 않은 것은 서로 다른 성과다.
+
 ## 검수와 상태 반영의 호출 흐름
 
 다음은 서버의 `extract_updates`, 응답 처리 래퍼, `process_action_stream`에서 발췌한 구간이다. 각 코드 블록은 해당 함수 안의 연속된 원문이며, 블록 사이의 생략 부분은 설명에 표시했다. 최종보고서 제3.8절의 판정 집행과 제3.15절의 통합 처리에 해당한다.
