@@ -291,4 +291,186 @@ def settlement_response_player_updates(
                 session["last_sequences"] = [s.model_dump() for s in pydantic_sequences]
 ```
 
-이 발췌는 판정 실패가 후속 상태 반영을 중단시키는 연결을 보여준다. `_apply_post_resolution`의 내부 적용·복구, 영속 저장과 Flutter 표시까지 포함하지는 않는다. 의미 판정의 정확도와 상태 보존·최종 표시의 관측 결과는 [최종보고서](../docs/Hallucination_최종보고서.pdf) 제4.4절에서 구분하여 설명한다.
+이 발췌는 판정 실패가 후속 상태 반영을 중단시키는 연결을 보여준다. 바깥 예외 처리의 복구와 저장·응답 순서는 아래에 이어서 제시한다. 의미 판정의 정확도와 상태 보존·최종 표시의 관측 결과는 [최종보고서](../docs/Hallucination_최종보고서.pdf) 제4.4절에서 구분하여 설명한다.
+
+## 실패 복구와 저장 후 응답
+
+앞의 검수 호출에서 발생한 예외는 `process_action_stream`의 바깥 예외 처리로 전달된다. 아래는 같은 구현의 행동 전 스냅샷, 복구, 저장 및 응답 전송 구간이다. 각 블록은 연속된 원문이며, 중간에 생략한 처리는 설명으로 구분한다.
+
+### 행동 전 상태와 복구 대상
+
+일반 행동을 준비하는 `prepare_active_phase`는 캐릭터의 상태 변경 전에 다음 스냅샷을 보관한다. 앞선 선택 검사와 뒤따르는 정산 준비는 생략하였다.
+
+```python
+        session[ACTIVE_TURN_PLAYER_SNAPSHOT_KEY] = player.snapshot()
+```
+
+게임 루프의 복구 메서드는 해당 스냅샷을 꺼내 같은 캐릭터 객체에 복원한다. 아래 두 블록은 각각 메서드 전체다. 기간 경계 복원과 런타임 캐시 해제 함수의 내부는 포함하지 않는다.
+
+```python
+    @staticmethod
+    def _restore_active_turn_player(session: dict) -> bool:
+        """Commit 전 실패 시 active turn의 Character 상태를 원상 복원한다."""
+        snapshot = session.pop(ACTIVE_TURN_PLAYER_SNAPSHOT_KEY, None)
+        player = session.get("player")
+        if snapshot is None or player is None:
+            return False
+        player.restore(snapshot)
+        return True
+```
+
+```python
+    def _rollback_active_turn(self, session_id: str, session: dict) -> None:
+        """Outer commit 전 상태를 복원하고 실패한 런타임 캐시를 폐기한다."""
+        restore_period_boundary_rollback_token(session)
+        self._restore_active_turn_player(session)
+        from src.cache.custom_cache import release_game_cache
+        release_game_cache(session_id)
+```
+
+`player.restore`는 저장 상태의 형식과 아이템 원장을 먼저 검증한다. 다음은 그 뒤 실제로 수치·소유물·위치를 대입하는 연속 구간이다. `restored_item_ledger`는 앞에서 스냅샷의 아이템 원장으로 생성한 객체다. 인물 정체성·관계 그래프·사회 관계 등의 다른 복원 부분은 생략하였다.
+
+```python
+        # Progression
+        self.level = snap.get("level", self.level)
+        self.exp = snap.get("exp", self.exp)
+        self.job = snap.get("job", self.job)
+        self.job_tier = snap.get("job_tier", self.job_tier)
+        self.gold = snap.get("gold", self.gold)
+
+        # Stats
+        if "stats" in snap and isinstance(snap["stats"], dict):
+            self.stats = snap["stats"]
+
+        # HP/MP
+        if "current_hp" in snap:
+            self._current_hp = snap["current_hp"]
+        if "current_mp" in snap:
+            self._current_mp = snap["current_mp"]
+
+        # Inventory & Equipment
+        self.inventory = snap.get("inventory", self.inventory)
+        self.item_ledger = restored_item_ledger
+        self.equipment = snap.get("equipment", self.equipment)
+        self.equipped_stats = snap.get("equipped_stats", self.equipped_stats)
+        self.equipment_registry = snap.get("equipment_registry", self.equipment_registry)
+        self.current_location = snap.get("current_location", self.current_location)
+        self.location_hierarchy = snap.get("location_hierarchy", self.location_hierarchy)
+```
+
+### 저장 완료를 확인한 뒤 전송
+
+`_commit_session_strict`는 저장 작업을 시작하고 완료 결과를 확인한다. 호출자가 취소되더라도 진행 중인 저장 작업을 기다리며, `save_task.result()`의 예외는 호출자에게 전달된다. `_save_session_strict`는 세션 저장 계층을 호출하며 그 내부와 DB 트랜잭션 구현은 발췌에서 생략하였다.
+
+```python
+    async def _commit_session_strict(self, session_id: str) -> bool:
+        """Persist one turn without mistaking to_thread cancellation for rollback.
+
+        Returns True when the caller was cancelled while persistence was in flight.
+        The save task is still awaited to a definitive success/failure before return.
+        """
+        save_task = asyncio.create_task(self._save_session_strict(session_id))
+        cancellation_requested = False
+        while not save_task.done():
+            try:
+                await asyncio.shield(save_task)
+            except asyncio.CancelledError:
+                if save_task.cancelled():
+                    raise
+                cancellation_requested = True
+        save_task.result()
+        return cancellation_requested
+```
+
+`process_action_stream`은 아래 저장 호출이 끝난 뒤 `save_committed`를 설정한다. 이 구간은 [상태 응답에 연결](#상태-응답에-연결)의 `STATE_UPDATE` 전송보다 앞에 있다. 중간의 알림 구성과 서술 이벤트 전송은 생략하였다.
+
+```python
+                self._mark_turn_succeeded(session, active_turn)
+                cancelled_during_save = await self._commit_session_strict(session_id)
+                save_committed = True
+                self._confirm_turn_commit(session, active_turn)
+                self._discard_active_turn_player_snapshot(session)
+                if cancelled_during_save:
+                    raise asyncio.CancelledError
+```
+
+그 응답의 `character`는 앞서 실제 캐릭터 객체에서 구성한다. `player_updates`는 위에서 설명한 정산 기반 변경량이고, `sequences`는 검수를 통과한 장면이다. 이 세 항목이 함께 `STATE_UPDATE`로 전달되며, Flutter에서 처리하는 내부는 포함하지 않는다.
+
+```python
+                char_state = self._map_character_state(
+                    player,
+                    session=session,
+                    session_id=session_id,
+                ).model_dump()
+```
+
+### 저장 전 실패와 저장 후 실패의 구분
+
+아래는 같은 `process_action_stream`의 일반 예외 처리 블록 전체다. 앞선 `try` 본문과 별도의 취소 예외 블록은 생략하였다. 저장 전 실패에서는 행동을 복구하고 세션 캐시를 해제한 뒤 오류 이벤트를 보낸다. 저장 후 오류에서는 이 복구 분기를 실행하지 않고 별도의 오류를 알린다. `is_conclusive_llm_generation_failure`의 분류와 턴 상태 기록 함수의 내부는 생략하였다.
+
+```python
+            except Exception as e:
+                logger.error(f"[SSE] Active phase error for session {session_id} (committed={save_committed}): {e}", exc_info=True)
+                if not save_committed:
+                    self._rollback_active_turn(session_id, session)
+                    conclusive_llm_failure = (
+                        is_conclusive_llm_generation_failure(e)
+                    )
+                    if conclusive_llm_failure:
+                        await self._mark_turn_rolled_back(
+                            session_id,
+                            session,
+                            active_turn,
+                            error_code=getattr(
+                                e,
+                                "error_code",
+                                "SCENE_GENERATION_FAILED",
+                            ),
+                            error_message=_SCENE_ROLLBACK_PLAYER_MESSAGE,
+                        )
+                        log_event(
+                            session_id,
+                            "scene_candidate_contained",
+                            player_action_id=active_turn["turn_id"],
+                            source="active",
+                            error_code=getattr(
+                                e,
+                                "error_code",
+                                type(e).__name__,
+                            ),
+                            evidence_ids=list(
+                                getattr(e, "evidence_ids", ())
+                            ),
+                            continuation="last_committed_scene",
+                        )
+                    else:
+                        await self._safe_mark_turn_failed(
+                            session_id,
+                            session,
+                            active_turn,
+                            error_code=getattr(e, "error_code", "TURN_FAILED"),
+                            error_message=_TURN_ROLLBACK_PLAYER_MESSAGE,
+                        )
+                    # commit 전 실패 → in-memory 폐기. 다음 요청은 DB의 마지막 commit 상태에서 재로드.
+                    self._session_svc.evict_session(session_id)
+                    yield SSEEvent(event=SSEEventType.ERROR, data={
+                        "error_code": (
+                            "SCENE_GENERATION_ROLLED_BACK"
+                            if conclusive_llm_failure
+                            else "TURN_ROLLBACK"
+                        ),
+                        "message": (
+                            _SCENE_ROLLBACK_PLAYER_MESSAGE
+                            if conclusive_llm_failure
+                            else _TURN_ROLLBACK_PLAYER_MESSAGE
+                        ),
+                    })
+                else:
+                    # commit 후 부수 작업(usage stats 등) 실패. 데이터는 이미 commit됨.
+                    yield SSEEvent(event=SSEEventType.ERROR, data={
+                        "error_code": "POST_COMMIT_ERROR",
+                        "message": str(e),
+                    })
+```
+
+이 발췌는 거절 예외가 복구로 이어지는 조건, 일부 상태의 실제 복원, 저장 완료 확인과 상태 응답 전송의 순서를 보여준다. 모든 상태·DB·클라이언트의 완전한 복구나 재시도 성공률까지 입증하지는 않는다. 이미 결과를 별도로 확정하는 보스전 등의 경로도 이 일반 행동 구간과 구분한다. 관측된 상태 유지·표시 결과와 수집 한도에 따른 진행 종료는 최종보고서 제4.2.1절과 제4.4절에 제시되어 있다.
