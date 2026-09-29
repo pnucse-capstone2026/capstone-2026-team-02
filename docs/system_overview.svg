@@ -1,0 +1,79 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1160" height="950" viewBox="0 0 1160 950" role="img" aria-labelledby="title desc">
+<title id="title">Hallucination 시스템 구성과 행동 처리</title>
+<desc id="desc">Flutter 앱은 REST와 SSE로 FastAPI 서버와 통신한다. 서버가 Gemini 호출, 기억과 관계, 확정 세션 저장을 연결한다. 일반 미확정 행동은 계산과 생성 뒤 검수를 거쳐 확정하거나 이전 상태를 유지하며, 축적한 경험은 이후 생성에 다시 사용한다.</desc>
+<defs>
+<marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto-start-reverse"><path d="M0 0L8 4L0 8Z" fill="#475569"/></marker>
+<marker id="blue" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto-start-reverse"><path d="M0 0L8 4L0 8Z" fill="#2563a6"/></marker>
+</defs>
+<rect width="1160" height="950" rx="16" fill="#f8fafc"/>
+<g font-family="Malgun Gothic, sans-serif" fill="#17283e">
+<text x="40" y="48" font-size="26" font-weight="700">Hallucination · 시스템 구성과 행동 처리</text>
+<text x="40" y="82" font-size="16" fill="#526276">클라이언트는 입력과 표시를, 서버는 실행·모델 호출·확정 상태를 관리한다.</text>
+<rect x="280" y="108" width="600" height="357" rx="16" fill="#f0f4f8" stroke="#c2cedb" stroke-dasharray="6 4"/>
+<text x="305" y="444" font-size="15" fill="#526276">서버 측 처리 · 기억 관리 · 저장</text>
+<g stroke="#aab8c9" stroke-width="1.5" fill="#fff">
+<rect x="40" y="145" width="220" height="100" rx="12"/>
+<rect x="460" y="145" width="240" height="100" rx="12"/>
+<rect x="900" y="145" width="220" height="100" rx="12"/>
+<rect x="310" y="325" width="245" height="90" rx="12" fill="#edf5ff" stroke="#81a7d4"/>
+<rect x="605" y="325" width="245" height="90" rx="12"/>
+<rect x="40" y="590" width="200" height="90" rx="12"/>
+<rect x="290" y="590" width="200" height="90" rx="12"/>
+<rect x="540" y="590" width="180" height="90" rx="12"/>
+<rect x="810" y="565" width="310" height="95" rx="12" fill="#edf8f1" stroke="#83ad93"/>
+<rect x="810" y="710" width="310" height="95" rx="12" fill="#fff4ec" stroke="#d0a78a"/>
+</g>
+<g text-anchor="middle">
+<g font-size="21" font-weight="700">
+<text x="150" y="183">Flutter 앱</text>
+<text x="580" y="183">FastAPI 서버</text>
+<text x="1010" y="183">Gemini</text>
+<text x="432" y="362">기억 · 관계</text>
+<text x="727" y="362">세션 저장</text>
+<text x="140" y="628">선택 · 규칙 계산</text>
+<text x="390" y="628">장면 후보 생성</text>
+<text x="630" y="628">후보 검수</text>
+<text x="965" y="603">결과 확정 · 저장</text>
+<text x="965" y="748">후보 적용 중단</text>
+</g>
+<g font-size="16" fill="#46566b">
+<text x="150" y="217">선택 전달 · 장면과 상태 표시</text>
+<text x="580" y="217">규칙 실행 · 생성 및 검수 조율</text>
+<text x="1010" y="217">서술 생성 · 의미 판정</text>
+<text x="432" y="391">4계층 기억 · 관계 하이퍼그래프</text>
+<text x="727" y="391">확정 상태 보관 · 재개</text>
+<text x="140" y="657">필요한 정산 결과</text>
+<text x="390" y="657">현재 상태와 경험 참고</text>
+<text x="630" y="657">구조 · 참조 · 의미</text>
+<text x="965" y="637">새 장면과 상태를 앱에 전달</text>
+<text x="965" y="782">이전 확정 장면·상태 유지 및 복구</text>
+</g>
+<g font-size="16" fill="#526276">
+<text x="360" y="162">REST · SSE</text>
+<text x="360" y="232">요청 / 상태·장면 응답</text>
+<text x="800" y="162">모델 요청</text>
+<text x="800" y="232">생성 후보 · 판정</text>
+<text x="425" y="284">조회 · 경험 반영</text>
+<text x="733" y="284">저장 · 재개</text>
+</g>
+</g>
+<line x1="40" y1="495" x2="1120" y2="495" stroke="#cbd5e1"/>
+<text x="40" y="535" font-size="22" font-weight="700">일반 미확정 행동의 처리와 경험 재활용</text>
+<text x="40" y="917" font-size="15" fill="#526276">이미 확정된 전투 결과 등은 별도 경로로 처리하며, 서술 복구 과정에서 중복 계산하지 않는다.</text>
+</g>
+<g fill="none" stroke="#475569" stroke-width="2" marker-end="url(#arrow)">
+<path d="M260 185H460"/><path d="M460 205H260"/>
+<path d="M700 185H900"/><path d="M900 205H700"/>
+<path d="M540 245V300H432V325" marker-start="url(#arrow)"/>
+<path d="M620 245V300H727V325" marker-start="url(#arrow)"/>
+<path d="M240 635H290"/><path d="M490 635H540"/>
+<path d="M720 625H770V610H810"/>
+<path d="M720 645H755V757H810"/>
+</g>
+<path d="M965 660V686H1140V855H390V680" fill="none" stroke="#2563a6" stroke-width="2" stroke-dasharray="6 4" marker-end="url(#blue)"/>
+<g font-family="Malgun Gothic, sans-serif" font-size="16">
+<text x="747" y="593" fill="#356445">통과</text>
+<text x="736" y="721" text-anchor="end" fill="#8c5230">거절 · 확인 실패</text>
+<text x="650" y="842" fill="#2563a6">경험 반영 → 이후 생성에서 다시 조회</text>
+</g>
+</svg>
