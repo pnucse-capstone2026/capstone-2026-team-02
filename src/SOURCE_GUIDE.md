@@ -2,6 +2,8 @@
 
 최종보고서의 설계·처리에 해당하는 함수·메서드와 클래스·열거형 일부를 발췌하였다. 생략된 보조 함수와 객체 초기화의 전제는 각 항목에 설명한다. 독립 실행 패키지는 아니다.
 
+처리 흐름: [수치 적용](#수치-변경의-권한과-실제-적용) · [정산과 응답](#시스템-수치로-구성하는-응답) · [기억 입력](#기억과-공동-경험의-생성-요청-연결) · [검수](#검수와-상태-반영의-호출-흐름) · [복구와 저장](#실패-복구와-저장-후-응답)
+
 | 파일 | 주요 기능 | 최종보고서 관련 항목 |
 |---|---|---|
 | [choice_binding.py](choice_binding.py) | 식별자 조회와 실행 정보 반환 | 자연어 선택과 실제 실행의 연결, 「파티 수락의 전체 처리 사례」 |
@@ -26,7 +28,7 @@
 
 `normalize_narrative_admission`은 검수 응답, 식별자·주장 본문을 가진 `evidence`, 근거 범위를 가진 `receipts`를 받는다. 증거 목록의 식별자는 호출 전에 유일하게 구성되어 있어야 한다. 응답에는 증거 식별자마다 `admit` 또는 `reject` 판정이 하나씩 있어야 한다.
 
-판정 개수, 필드 구성, 식별자의 유효성과 중복, 판정 값 및 근거 범위를 검사한다. 예를 들어 증거가 두 개일 때 같은 식별자의 판정을 두 번 반환하면 판정 개수가 맞더라도 오류가 된다. 정상 형식의 응답에서는 `reject`인 항목만 해당 주장과 함께 반환한다. 빈 목록은 거절 판정이 없다는 뜻이며, 문장의 사실성을 보증하지 않는다.
+판정 개수, 필드 구성, 식별자의 유효성과 중복, 판정 값 및 근거 범위를 검사한다. 예를 들어 증거가 두 개일 때 같은 식별자의 판정을 두 번 반환하면 판정 개수가 맞더라도 오류가 된다. 정상 형식의 응답에서는 `reject`인 항목만 해당 주장과 함께 반환한다. 빈 목록은 거절 판정이 없다는 뜻이다.
 
 형식 위반 시 `LLMResponseContractException`을 발생시킨다. 이 함수는 자연어의 진위를 판단하지 않고 판정 응답을 검사한다.
 
@@ -44,11 +46,175 @@
 
 `EdgeType`에는 공동 사건 조회에 쓰는 세 관계 유형을, `HyperEdge`에는 여러 노드를 역할과 함께 연결하는 필드를 담았다. `HyperGraph.add_edge`는 참조 노드의 존재를 확인하고 간선과 노드별 인접 인덱스를 등록한다. `get_shared_events`는 두 노드 중 인접 간선이 적은 쪽을 탐색하여, 두 노드가 모두 포함된 참여·목격·원인 관계를 가중치 내림차순으로 반환한다.
 
-노드·간선 사전과 인접 인덱스는 호출 전에 초기화되어 있어야 한다. 반환된 간선 목록을 장면 맥락으로 구성하고 생성 모델에 전달하는 처리는 이후 단계에서 수행한다.
+노드·간선 사전과 인접 인덱스는 호출 전에 초기화되어 있어야 한다. 조회 결과를 맥락으로 구성하고 생성 요청에 전달하는 연결은 [기억과 공동 경험의 생성 요청 연결](#기억과-공동-경험의-생성-요청-연결)에 제시한다.
+
+## 수치 변경의 권한과 실제 적용
+
+상태에서 응답 수치를 계산하는 것과 상태 자체를 변경하는 것은 별개의 단계다. 아래는 생성 응답의 수치 필드를 거절하는 경계와 전투 시스템이 캐릭터 수치를 변경하는 구간이다. 각 블록은 기존 구현의 연속된 원문이다.
+
+### 생성 응답의 필드 검사
+
+[추출 응답 처리](#응답-검사와-추출-결과-반환)에서 호출하는 `project_fresh_system_updates`는 다음 필드 검사로 시작한다. 허용된 기본 필드와 선택적인 `public_speech_priors` 외의 필드가 있으면 오류를 발생시킨다. 따라서 이 경로에 `player_updates`, `hp_change`, `mp_change`, `gold_change`를 추가한 생성 응답은 그대로 적용되지 않는다. 뒤따르는 인물 참조 검사와 반환은 생략하였다.
+
+```python
+def project_fresh_system_updates(
+    raw_response: Any,
+    raw_catalog: Any,
+    *,
+    new_actors: Sequence[Mapping[str, Any]],
+    player_name: str,
+    allowed_actor_refs: Sequence[str],
+) -> dict[str, Any]:
+    """Project Phase2 actor references without asking it to re-author identity."""
+    if not isinstance(raw_response, Mapping):
+        raise ValueError("fresh SYSTEM_UPDATES response must be an object")
+    expected_response_fields = {
+        "actor_updates",
+        "dialogue_observations",
+        "memory_update",
+        "memory_importance",
+    }
+    response_fields = set(raw_response)
+    if response_fields not in (
+        expected_response_fields,
+        expected_response_fields | {PUBLIC_SPEECH_PRIORS_FIELD},
+    ):
+        raise ValueError(
+            "fresh SYSTEM_UPDATES response must use the exact provider shape"
+        )
+```
+
+`PUBLIC_SPEECH_PRIORS_FIELD`는 `public_speech_priors`를 가리킨다. 이 함수의 `ValueError`는 [응답 검사와 추출 결과 반환](#응답-검사와-추출-결과-반환)에 제시한 호출부에서 계약 오류로 전달되어 후속 처리를 중단한다. 이 필드 검사는 인물 참조 자료를 사용하는 응답 경로에 적용된다.
+
+### 전투 결과의 HP·MP 반영
+
+`prepare_active_phase`가 호출하는 `resolve_pending_states`에서 보류된 전투를 수락한 분기는 다음과 같이 전투 서비스를 호출한다. `enc`와 `floor`는 앞에서 읽은 전투 정보이고, `actor_outcome_kwargs`는 참여 인물의 결과 처리에 필요한 맥락이다. 선택 확인과 이 값들의 준비는 생략하였다.
+
+```python
+                    result = self._loop._combat.resolve_mob_combat(
+                        player, floor, enc, allow_auto_flee=False,
+                        **actor_outcome_kwargs,
+                    )
+```
+
+전투 서비스는 같은 인자들을 내부의 `resolve_mob_combat`에 전달한다. 아래는 내부 메서드의 시뮬레이션 실행과 결과 적용이다. `sim`에는 캐릭터에서 만든 `player_combatant`와 상대 전투 개체가 앞서 등록되어 있다. 개체 구성과 전투 계산식은 생략하였다.
+
+```python
+        result = sim.simulate(max_turns=50)
+        party_history_candidate = player.party_combat_history_update(
+            party_combat_records,
+            sim.party_coordination_outcomes(),
+        )
+
+        # 결과 적용
+        player.current_hp = max(0, int(player_combatant.stats.hp))
+        player.current_mp = max(0, int(player_combatant.stats.mp))
+        hp_after = player.current_hp
+```
+
+여기서 실제 HP·MP에 대입되는 값은 시뮬레이터가 갱신한 전투 개체의 값이다. 생성 문장에서 수치를 추출하여 이 대입에 사용하는 구조가 아니다.
+
+### 전투 보상의 골드 반영
+
+같은 전투 메서드는 보상 지급이 가능한 승리일 때 시뮬레이터의 시드·사건과 상대 정보로 보상 입력을 만든다.
+
+```python
+        reward_context = None
+        if award_rewards and result == "player_victory" and not is_pk:
+            reward_context = build_combat_reward_context(
+                combat_id=combat_id,
+                seed=sim.seed,
+                events=sim.events,
+                monsters=defeated_info,
+            )
+```
+
+그 뒤 실제 처치 대상이 있는지 확인하여 보상 계산을 호출한다. 두 블록 사이의 처치·도주 표시 정보 구성은 생략하였다.
+
+```python
+        if (
+            award_rewards
+            and result == "player_victory"
+            and not is_pk
+            and reward_context is not None
+            and reward_context.targets
+        ):
+            rewards = self._svc.calculate_combat_rewards(
+                player,
+                reward_context,
+                staged=True,
+            )
+```
+
+`CombatService.calculate_combat_rewards`의 위임 메서드 전체는 다음과 같다.
+
+```python
+    def calculate_combat_rewards(self, player, reward_context, staged=False, party_size=1, is_first_clear=False):
+        return self._rewards.calculate_combat_rewards(player, reward_context, staged=staged, party_size=party_size, is_first_clear=is_first_clear)
+```
+
+보상 계산기는 위에서 구성한 `CombatRewardContext`를 받는다. 다른 형식의 입력은 `TypeError`로 거절한다.
+
+```python
+        if not isinstance(reward_context, CombatRewardContext):
+            raise TypeError(
+                "combat rewards require a CombatRewardContext built from "
+                "simulator seed and defeat events"
+            )
+```
+
+보상 대상별 반복문 안에서는 시스템 계산값을 합산한다. 앞선 대상 선정·보상 제외 조건과 계산 함수 내부는 생략하였다.
+
+```python
+            exp = self.calculate_exp_reward(player_level, monster_level, monster_grade, hp_percent)
+            gold = self.calculate_gold_reward(player_level, monster_level, monster_grade)
+
+            # 레이드 인원 분배 (party_size > 1일 때만)
+            if party_size > 1:
+                exp = int(exp / party_size)
+                gold = int(gold / party_size)
+
+            total_exp += exp
+            total_gold += gold
+```
+
+합산한 골드는 같은 메서드에서 실제 캐릭터에 반영한다. 사이의 아이템·경험치 처리와 뒤따르는 알림 구성은 생략하였다. `staged=True`는 이 경로에서 장비·재료 적용을 보류하는 옵션이며, 골드 적용을 보류하지 않는다.
+
+```python
+        if total_gold > 0:
+            gold_result = player.adjust_gold(total_gold, "전투 보상")
+```
+
+`adjust_gold` 내부의 실제 대입은 다음과 같다. 메서드의 로그 기록과 반환값 구성은 생략하였다.
+
+```python
+        old_gold = self.gold
+        self.gold = max(0, self.gold + amount)
+        actual_change = self.gold - old_gold
+```
+
+전투 후의 캐릭터 상태는 아래 정산 생성의 입력이 된다. 이동·시설·아이템 사용 등 다른 상태 변경 경로는 이 발췌에 포함하지 않았다.
 
 ## 시스템 수치로 구성하는 응답
 
 게임 상태의 수치와 생성 문장의 주장은 서로 다른 근거를 가진다. 아래는 서버의 실제 전후 상태에서 자원 변경량을 계산하고, 정산 결과가 있는 응답의 수치 필드에 그 값을 사용하는 구간이다. 기존 발췌와 같은 구현에서 가져왔으며 각 코드 블록은 연속된 원문이다.
+
+### 행동 전 비교 기준의 갱신
+
+`prepare_active_phase`는 해당 행동을 처리하기 전에 비교 기준을 다시 기록한다. 아래는 행동 전 수치 사전의 대입 전체다. 앞선 캐릭터 조회와 별도의 복구용 스냅샷 처리는 생략하였다.
+
+```python
+        session["_pre_action_stats"] = {
+            "hp": player.current_hp,
+            "mp": player.current_mp,
+            "gold": player.gold,
+            "exp": getattr(player, "exp", 0),
+            "level": getattr(player, "level", 0),
+            "location": getattr(player, "current_location", ""),
+        }
+```
+
+정산 생성 시 `session.pop("_pre_action_stats", None)`으로 이 사전을 꺼낸다. `_last_settlement_result`는 행동 준비 단계에서 초기화하지 않고, 아래 정상 완료 경로에서 새 정산으로 덮어쓴다.
 
 ### 실제 상태에서 자원 변경량 계산
 
@@ -114,7 +280,7 @@
         session["_last_settlement_result"] = settlement_result.to_dict()
 ```
 
-이 대입으로 현재 행동의 정산이 `session["_last_settlement_result"]`에 기록된 뒤 후속 상태 처리가 반환된다. 게임 루프는 이후 저장 완료를 확인하고, 상태 응답을 구성할 때 이 키를 읽는다. 위 대입 자체는 메모리상의 세션 기록이며 DB 저장은 [실패 복구와 저장 후 응답](#실패-복구와-저장-후-응답)의 별도 단계다. 이 구간은 일반 행동의 정상 완료 경로에서 정산이 준비되는 위치를 보여주며, 모든 호출 경로에서 정산이 존재한다고 보장하는 것은 아니다.
+일반 행동의 정상 완료 경로에서는 현재 정산을 `session["_last_settlement_result"]`에 기록한 뒤 후속 상태 처리가 반환된다. 게임 루프는 이후 저장 완료를 확인하고, 상태 응답을 구성할 때 이 키를 읽는다. 위 대입은 메모리상의 세션 기록이며 DB 저장은 [실패 복구와 저장 후 응답](#실패-복구와-저장-후-응답)에서 별도로 처리한다.
 
 ### 정산 결과로 응답 수치 구성
 
@@ -163,7 +329,7 @@ def settlement_response_player_updates(
     return updates
 ```
 
-보조 함수 `_copy_player_updates`는 매핑을 깊은 복사하고, `_response_player_update_int`는 불리언을 제외한 정수만 허용한다. `_reject_existing_resource_updates`는 스냅샷이 없는 정산에 기존 HP·MP·골드 변경 필드가 섞여 있으면 오류를 발생시킨다. `SettlementResult`의 객체 정의와 이 보조 함수들은 생략하였다. 정산 자체가 `None`이면 기존 필드를 반환하는 분기도 있으므로, 이 함수만으로 모든 호출의 정산 존재를 보장한다고 해석하지 않는다.
+보조 함수 `_copy_player_updates`는 매핑을 깊은 복사하고, `_response_player_update_int`는 불리언을 제외한 정수만 허용한다. `_reject_existing_resource_updates`는 스냅샷이 없는 정산에 기존 HP·MP·골드 변경 필드가 섞여 있으면 오류를 발생시킨다. `SettlementResult`의 객체 정의와 이 보조 함수들은 생략하였다. 정산이 `None`이면 기존 응답 필드를 그대로 반환한다.
 
 ### 상태 응답에 연결
 
@@ -201,7 +367,200 @@ def settlement_response_player_updates(
                 })
 ```
 
-이 구간은 정산 결과가 있는 응답에서 수치 변경량의 출처와 전달을 보여준다. 전투 계산식, 모든 상태 변경 경로, 영속 저장과 Flutter의 소비 구현 전체를 포함하지는 않는다. 최종보고서 제4.4절의 전투 결과와 제4.4.1절의 MP 불변 사례는 실제 관측 결과를 별도로 제시한다. 서술 오류가 수치 변경으로 이어지지 않은 것과, 그 오류 문장이 사용자에게 표시되지 않은 것은 서로 다른 성과다.
+정산 결과가 있는 응답의 수치 변경량은 실제 상태의 전후 차이로 구성된다. 전투 계산식 전체와 Flutter의 응답 처리는 생략하였다. 최종보고서 제4.4절에 전투 관측 결과를, 제4.4.1절에 잘못된 마나 회복 서술이 표시되었지만 실제 MP는 유지된 사례를 제시하였다.
+
+## 기억과 공동 경험의 생성 요청 연결
+
+장기 기억은 일반 행동 서술의 입력으로, 공동 경험은 시작 장면의 맥락으로 전달된다. 아래에 두 경로의 조회·조립·요청 코드를 제시한다. 프롬프트 본문과 기억 선택 알고리즘 내부는 생략하였다.
+
+### 장기 기억에서 일반 행동 서술로
+
+캐릭터의 `get_memory_context`는 연결된 기억 시스템에 조회를 위임한다. 아래는 그 분기다. 뒤따르는 미연결 오류 처리는 생략하였다.
+
+```python
+        if self._memory_system:
+            return self._memory_system.get_context(
+                exclude_sensory=exclude_sensory,
+                seen_contents=seen_contents,
+                scene_start=scene_start,
+                scene_end=scene_end,
+            )
+```
+
+기억 시스템의 `get_context`는 입력 예산과 각 계층을 맥락 구성기에 전달한다. 아래는 반환 구간이며, 앞선 예산 결정과 구성기 내부의 선택·요약 처리는 생략하였다. 일화 기억에는 [기억 승격](#작업-기억에서-일화-기억으로의-승격)에서 추가한 항목이 보관되며, 입력에는 예산에 맞게 선택한 항목을 사용한다.
+
+```python
+        return self._budget.build_context(
+            total_budget, self.sensory, self.working, self.episodic, self.semantic,
+            exclude_sensory=exclude_sensory,
+            seen_contents=seen_contents,
+            scene_start=scene_start,
+            scene_end=scene_end,
+        )
+```
+
+일반 행동의 생성 요청을 만드는 구간은 이 기억을 조회하고 현재 정산과 충돌하는 기억 맥락을 검사한다. `seen_contents`는 이미 공급한 내용의 중복을 줄이기 위한 집합이다. 검사 함수 내부는 생략하였다.
+
+```python
+        _long_term_memory = self._guardrail.filter_llm_memory_context_for_mechanical_conflicts(
+            player.get_memory_context(
+                exclude_sensory=True,
+                seen_contents=session.get("_prompt_seen_contents"),
+            ),
+            session,
+        )
+```
+
+그 반환값은 `format_kwargs.update(...)`의 다음 인자로 전달된다. 아래 한 줄은 호출의 키워드 인자 발췌이며 독립 문장이 아니다.
+
+```python
+            long_term_memory=_long_term_memory,
+```
+
+템플릿의 `long_term_memory` 자리에 값을 넣은 뒤 요청의 `user_prompt`로 전달한다. 다음 두 블록 사이의 요청 부가 정보 구성과 조건부 서두 추가는 생략하였다.
+
+```python
+        prompt = prompt_template.format(**format_kwargs)
+```
+
+```python
+        request = LLMRequest(
+            cacheable_prefix=build_cacheable_block(_revealed, _awareness, _pioneer_arg),
+            user_prompt=prompt,
+            prompt_name=prompt_name, response_schema=schema,
+            cache_type="narrative",
+            deathgame_revealed=_revealed,
+            max_output_tokens=16384,
+            metadata=request_metadata,
+        )
+```
+
+이 요청은 아래 호출로 응답 처리 래퍼에 전달된다. 사이의 `project_active_response` 정의는 생략하였다. 래퍼가 실제 모델 라우터의 `generate`를 호출하는 구간은 [응답 검사와 추출 결과 반환](#응답-검사와-추출-결과-반환)에 제시되어 있다.
+
+```python
+        projected = await self._generate_scene_response_with_structural_recovery(
+            request,
+            project_active_response,
+        )
+```
+
+### 공동 사건 조회에서 시작 장면 요청으로
+
+`build_encounter_history_context`는 앞서 공개한 `get_shared_events`의 결과에서 사건 요약을 선택한다. 아래는 목록 초기화부터 반환까지의 원문이다. 인자 선언은 생략하였으며, `npc_ids`는 조회할 인물 식별자 목록이고 `max_events_per_npc`는 인물별 최대 사건 수다. 기존 인자 이름에 `npc`가 쓰이지만 게임 속 다른 플레이어를 가리킨다.
+
+```python
+        lines: List[str] = []
+
+        for npc_id in npc_ids[:5]:
+            node = graph.get_node(npc_id)
+            if not node:
+                continue
+            shared = get_shared_events(graph, player_id, npc_id)
+            if not shared:
+                continue
+            for edge in shared[:max_events_per_npc]:
+                content = edge.properties.get("summary", "")
+                if not content:
+                    continue
+                if seen_contents is not None and content in seen_contents:
+                    continue
+                lines.append(f"- {node.label}과(와)의 경험: {content}")
+                if seen_contents is not None:
+                    seen_contents.add(content)
+        return "\n".join(lines)
+```
+
+맥락 구성기는 현재 인물·파티에서 준비한 식별자 목록으로 위 함수를 호출하고 결과가 있을 때만 `[공유 경험]` 항목에 넣는다. 앞선 식별자 목록 구성과 이후 관계 정보 구성은 생략하였다. `episodic_memory` 인자는 이 조회 함수에서 사용하지 않으며, 공급되는 내용은 위 코드의 간선 `summary`다.
+
+```python
+                if encountered_nids:
+                    _mem_sys = session.get("memory_system")
+                    _episodic = _mem_sys.episodic if _mem_sys else None
+                    _seen = session.get("_prompt_seen_contents")
+                    history_ctx = GraphQueries.build_encounter_history_context(
+                        session["graph"], player._graph_node_id, encountered_nids,
+                        episodic_memory=_episodic,
+                        seen_contents=_seen,
+                    )
+                    if history_ctx:
+                        parts.append(f"[공유 경험]\n{history_ctx}")
+```
+
+이 항목은 `active_narration_projection`이 거짓일 때 `world_context`에 추가된다. 일반 행동 서술용 맥락에서는 이 값이 참이므로 해당 블록을 추가하지 않는다. 앞선 위치 정보 구성과 뒤따르는 파티·안내 정보 추가는 생략하였다.
+
+```python
+            if not active_narration_projection:
+                wc_parts.extend(self._build_graph_and_arc_context(session, player))
+
+            wc_parts = [
+                self._filter_llm_context_conflicts(part, session, player)
+                for part in wc_parts
+                if part
+            ]
+            world_context = "\n\n".join(part for part in wc_parts if part)
+```
+
+시작 장면에서는 `get_world_context`가 `OPENING_SCENE`에 해당하는 맥락을 반환하고, 구간 처리의 호출자가 이를 생성 메서드에 전달한다. 게임 루프의 `_get_world_context`는 맥락 구성기의 동명 메서드에 위임한다.
+
+```python
+        _, world_context = self.build_classified_context(
+            session,
+            opening_location_scope=strategy_key == "OPENING_SCENE",
+        )
+        return world_context
+```
+
+```python
+            new_scene = await self._loop._scene_engine.generate_opening_scene(
+                player, session, self._loop._get_world_context("OPENING_SCENE", session)
+            )
+```
+
+`generate_opening_scene`은 전달받은 값을 `format_kwargs.update(...)`의 아래 인자로 넣는다. 이 한 줄 역시 호출의 키워드 인자 발췌다. `_without_scene_route_catalog_blocks`는 장면 경로 목록 블록을 제외하는 함수이며 내부는 생략하였다.
+
+```python
+            world_context=_without_scene_route_catalog_blocks(world_context),
+```
+
+그 뒤 템플릿을 채우고 시작 장면 요청을 만든다. 사이의 응답 스키마·공통 입력 준비는 생략하였다.
+
+```python
+        prompt = user_template.format(**format_kwargs)
+```
+
+```python
+        request = LLMRequest(
+            cacheable_prefix=build_cacheable_block(_revealed, _awareness, _pioneer_arg),
+            user_prompt=prompt,
+            prompt_name="PROMPT_OPENING_SCENE", response_schema=schema,
+            cache_type="narrative",
+            deathgame_revealed=_revealed,
+            max_output_tokens=16384,
+            metadata=_llm_request_metadata_for_session(session),
+        )
+```
+
+후보 생성 반복문에서는 이 요청의 식별자와 부가 정보만 갱신한 복사본을 만들고, 응답 처리 래퍼에 전달한다. 아래 두 블록 사이에는 `try`가 있으며 주변 반복문과 예외 처리는 생략하였다. `user_prompt`는 이 복사 과정에서 바꾸지 않는다.
+
+```python
+            candidate_request = request.model_copy(update={
+                "operation_id": request.operation_id if candidate_attempt == 1 else str(uuid4()),
+                "metadata": {
+                    **request.metadata,
+                    "opening_candidate_attempt": candidate_attempt,
+                    "opening_candidate_limit": candidate_limit,
+                },
+            })
+```
+
+```python
+                projected = await self._generate_scene_response_with_structural_recovery(
+                    candidate_request,
+                    project_opening_response,
+                )
+```
+
+선택된 기억·사건 요약은 위 경로를 통해 요청 입력에 포함된다. 공유 경험의 관측 사례는 2026년 8월 1일의 별도 실행 결과다. 해당 사례와 기억 입력 비교의 실험 조건·결과는 [README](../README.md#실제-동작과-평가-결과)에 정리하였다.
 
 ## 검수와 상태 반영의 호출 흐름
 
@@ -513,4 +872,4 @@ def settlement_response_player_updates(
                     })
 ```
 
-이 발췌는 거절 예외가 복구로 이어지는 조건, 일부 상태의 실제 복원, 저장 완료 확인과 상태 응답 전송의 순서를 보여준다. 모든 상태·DB·클라이언트의 완전한 복구나 재시도 성공률까지 입증하지는 않는다. 이미 결과를 별도로 확정하는 보스전 등의 경로도 이 일반 행동 구간과 구분한다. 관측된 상태 유지·표시 결과와 수집 한도에 따른 진행 종료는 최종보고서 제4.2.1절과 제4.4절에 제시되어 있다.
+위 코드는 일반 행동에서 저장 전 실패를 복구하고, 저장 완료 후 상태 응답을 전송하는 경로다. DB 트랜잭션, Flutter의 처리, 결과를 별도로 확정하는 보스전 경로는 생략하였다. 상태 유지·표시 결과와 수집 한도에 따른 진행 종료는 최종보고서 제4.2.1절과 제4.4절에 제시하였다.
