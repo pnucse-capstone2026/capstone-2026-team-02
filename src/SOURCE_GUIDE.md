@@ -74,7 +74,47 @@
         )
 ```
 
-정산 객체를 만드는 `SettlementResult.from_pipeline_state`는 이 메서드에 행동 전 상태와 현재 캐릭터를 전달한다. 다른 정산 필드의 구성과 객체 저장 처리는 이 발췌에 포함하지 않았다.
+### 현재 행동의 정산 생성과 세션 기록
+
+후속 상태 처리의 `apply_post_resolution_inner`는 아래 호출로 현재 행동의 정산을 구성한다. 앞선 상태 적용과 드롭 처리, 뒤따르는 처리는 생략하였다.
+
+```python
+        self._settlements.apply_post_resolution_settlement(
+            session=session,
+            player=player,
+            result=result,
+            transition_result=transition_result,
+            scene_frame_contract=session.get("_last_scene_time_contract"),
+            drop_settlement=drop_settlement,
+        )
+```
+
+호출된 `apply_post_resolution_settlement`는 행동 전 스냅샷과 현재 캐릭터를 `SettlementResult.from_pipeline_state`에 전달한다. 이 구성 메서드는 위의 `ResourceDelta.from_player`로 자원 변경량을 만든다. 아래는 정산 객체 생성, 응답 변경량 반영, 세션 기록이 이어지는 원문이다. 앞에서 준비한 전투·드롭·시간 등의 지역변수와 구성 메서드의 다른 필드는 생략하였다.
+
+```python
+        pre_stats = session.pop("_pre_action_stats", None)
+        existing_player_updates = result.get("player_updates")
+
+        settlement_result = SettlementResult.from_pipeline_state(
+            scene_frame_contract=scene_frame_contract,
+            transition_result=transition_result,
+            combat_result=combat_result,
+            environmental_hazard=environmental_hazard,
+            pre_action_stats=pre_stats,
+            player=player,
+            notices=snapshot_pending_game_notices(session),
+            drop_settlement=drop_settlement,
+            runtime_tick=runtime_tick,
+            pre_llm_snapshot=pre_llm_snapshot,
+            execution_outcome=session.get(EXECUTION_OUTCOME_KEY),
+        )
+        result["player_updates"] = settlement_result.response_player_updates(
+            existing_player_updates
+        )
+        session["_last_settlement_result"] = settlement_result.to_dict()
+```
+
+이 대입으로 현재 행동의 정산이 `session["_last_settlement_result"]`에 기록된 뒤 후속 상태 처리가 반환된다. 게임 루프는 이후 저장 완료를 확인하고, 상태 응답을 구성할 때 이 키를 읽는다. 위 대입 자체는 메모리상의 세션 기록이며 DB 저장은 [실패 복구와 저장 후 응답](#실패-복구와-저장-후-응답)의 별도 단계다. 이 구간은 일반 행동의 정상 완료 경로에서 정산이 준비되는 위치를 보여주며, 모든 호출 경로에서 정산이 존재한다고 보장하는 것은 아니다.
 
 ### 정산 결과로 응답 수치 구성
 
